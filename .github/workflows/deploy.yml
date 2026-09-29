@@ -1,109 +1,66 @@
-name: Build and Deploy Fullstack App to EC2 Docker
+name: Build and Deploy Full-Stack App Template to EC2 Docker
 
 on:
   push:
     branches: [main]
   workflow_dispatch:
 
-permissions:
-  contents: read
-  id-token: write
-
-concurrency:
-  group: deploy-ec2-fullstack
-  cancel-in-progress: false
+env:
+  AWS_REGION: ap-south-1
+  ECR_REGISTRY: 759204735992.dkr.ecr.ap-south-1.amazonaws.com
+  ECR_REPOSITORY: fullstack-app-template
+  INSTANCE_ID: i-0763c275a44301232
+  PUBLIC_URL: http://3.108.70.64
 
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
-    env:
-      AWS_REGION: ap-south-1
-      ECR_REGISTRY: 759204735992.dkr.ecr.ap-south-1.amazonaws.com
-      ECR_REPOSITORY: fullstack-app-template
-      INSTANCE_ID: i-0763c275a44301232
-      HEALTH_URL: http://3.108.70.64
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        run: |
+          export AWS_ACCESS_KEY_ID="${{ secrets.AWS_ACCESS_KEY_ID }}"
+          export AWS_SECRET_ACCESS_KEY="${{ secrets.AWS_SECRET_ACCESS_KEY }}"
+          echo "AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}" >> $GITHUB_ENV
+          echo "AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}" >> $GITHUB_ENV
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Configure AWS credentials (static keys)
+      - name: Authenticate to Amazon ECR
         run: |
-          export AWS_ACCESS_KEY_ID="${{ secrets.AWS_ACCESS_KEY_ID }}"
-          export AWS_SECRET_ACCESS_KEY="${{ secrets.AWS_SECRET_ACCESS_KEY }}"
-          export AWS_DEFAULT_REGION="$AWS_REGION"
-          echo "AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}" >> /tmp/aws-env
-          echo "AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}" >> /tmp/aws-env
-          echo "AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION}" >> /tmp/aws-env
+          aws ecr get-login-password --region "$AWS_REGION" \
+            | docker login --username AWS --password-stdin "$ECR_REGISTRY"
 
-      - name: Compute image URI and build diagnostics
+      - name: Compute image URI
         run: |
-          FULL_IMAGE="$ECR_REGISTRY/$ECR_REPOSITORY"
-          echo "FULL_IMAGE=$FULL_IMAGE" >> "$GITHUB_ENV"
+          FULL_IMAGE="$ECR_REGISTRY/$ECR_REPOSITORY:${GITHUB_SHA::8}"
+          echo "IMAGE_URI=$FULL_IMAGE" >> $GITHUB_ENV
           echo "Building image: $FULL_IMAGE"
-          echo "Dockerfile context: . (repo root unified Dockerfile)"
-          docker version
-          echo "--- Repository top-level contents ---"
-          ls -la
 
-      - name: Build Docker image
+      - name: Build Docker image (root unified Dockerfile)
         run: |
-          export "$(grep AWS_DEFAULT_REGION /tmp/aws-env)"
-          export "$(grep AWS_ACCESS_KEY_ID /tmp/aws-env)"
-          export "$(grep AWS_SECRET_ACCESS_KEY /tmp/aws-env)"
           docker build \
             --build-arg VITE_API_BASE_URL="" \
-            -t "$FULL_IMAGE:${{ github.sha }}" \
-            -t "$FULL_IMAGE:latest" \
+            -t "$IMAGE_URI" \
             -f Dockerfile .
 
-      - name: Smoke test built image (frontend serves on 80)
+      - name: Push Docker image
         run: |
-          docker run -d --name smoke-test -p 8099:80 "$FULL_IMAGE:${{ github.sha }}"
-          for i in $(seq 1 12); do
-            if curl -fsS -o /dev/null http://localhost:8099/; then
-              echo "Smoke test passed: HTTP 200 from container"
-              docker rm -f smoke-test
-              exit 0
-            fi
-            sleep 5
-          done
-          echo "Smoke test failed"
-          docker logs smoke-test || true
-          docker rm -f smoke-test
-          exit 1
+          docker push "$IMAGE_URI"
 
-      - name: Login to Amazon ECR and push
+      - name: Deploy to EC2 via SSM
         run: |
-          export "$(grep AWS_DEFAULT_REGION /tmp/aws-env)"
-          export "$(grep AWS_ACCESS_KEY_ID /tmp/aws-env)"
-          export "$(grep AWS_SECRET_ACCESS_KEY /tmp/aws-env)"
-          aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "$ECR_REGISTRY"
-          docker push "$FULL_IMAGE:${{ github.sha }}"
-          docker push "$FULL_IMAGE:latest"
-
-      - name: Deploy to EC2 via SSM (restart container on port 80)
-        run: |
-          export "$(grep AWS_DEFAULT_REGION /tmp/aws-env)"
-          export "$(grep AWS_ACCESS_KEY_ID /tmp/aws-env)"
-          export "$(grep AWS_SECRET_ACCESS_KEY /tmp/aws-env)"
-          IMAGE="$FULL_IMAGE:latest"
-          REGION="$AWS_REGION"
-          REGISTRY="$ECR_REGISTRY"
-          cat > /tmp/ssm-params.json << SSMPARAMS
+          cat > /tmp/ssm-params.json << 'SSMPARAMS'
           {
             "commands": [
-              "export REGION=$REGION",
-              "export ECR_REGISTRY=$REGISTRY",
-              "export IMAGE_URI=$IMAGE",
-              "aws ecr get-login-password --region \$REGION | docker login --username AWS --password-stdin \$ECR_REGISTRY",
-              "docker pull \$IMAGE_URI",
+              "aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${ECR_REGISTRY}",
+              "docker pull ${IMAGE_URI}",
               "docker stop app || true",
               "docker rm app || true",
-              "docker run -d --restart always -p 80:80 --name app \$IMAGE_URI",
-              "docker ps"
+              "docker run -d --restart always -p 80:80 --name app ${IMAGE_URI}"
             ]
           }
           SSMPARAMS
@@ -111,50 +68,40 @@ jobs:
             --instance-ids "$INSTANCE_ID" \
             --region "$AWS_REGION" \
             --document-name "AWS-RunShellScript" \
+            --comment "Deploy fullstack-app-template ${GITHUB_SHA::8}" \
             --parameters file:///tmp/ssm-params.json \
             --query "Command.CommandId" --output text)
-          echo "SSM CommandId: $COMMAND_ID"
+          echo "SSM Command ID: $COMMAND_ID"
           for i in $(seq 1 30); do
             STATUS=$(aws ssm get-command-invocation \
               --command-id "$COMMAND_ID" \
               --instance-id "$INSTANCE_ID" \
               --region "$AWS_REGION" \
               --query "Status" --output text)
-            echo "SSM status: $STATUS"
-            case "$STATUS" in
-              Success) exit 0 ;;
-              Failed|Cancelled|TimedOut)
-                aws ssm get-command-invocation --command-id "$COMMAND_ID" \
-                  --instance-id "$INSTANCE_ID" --region "$AWS_REGION" \
-                  --query "StandardErrorContent" --output text || true
-                exit 1 ;;
-            esac
+            echo "Attempt $i: $STATUS"
+            if [ "$STATUS" = "Success" ]; then exit 0; fi
+            if [ "$STATUS" = "Failed" ] || [ "$STATUS" = "Cancelled" ] || [ "$STATUS" = "TimedOut" ]; then
+              aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" \
+                --region "$AWS_REGION" --query "{Stdout:StandardOutputContent,Stderr:StandardErrorContent}"
+              exit 1
+            fi
             sleep 10
           done
-          echo "SSM command did not complete in time"
+          echo "SSM command timed out"
           exit 1
 
-      - name: Wait for service startup
-        run: sleep 60
-
-      - name: Final health check (must return HTTP 200)
+      - name: Verify deployment health
         run: |
+          echo "Waiting for containers and services to start on $PUBLIC_URL ..."
+          sleep 60
           for i in $(seq 1 20); do
-            CODE=$(curl -s -o /dev/null -w "%{http_code}" "$HEALTH_URL" || echo "000")
-            echo "Attempt $i: HTTP $CODE from $HEALTH_URL"
-            if [ "$CODE" = "200" ]; then
-              echo "Deployment verified: $HEALTH_URL returned HTTP 200"
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 15 "$PUBLIC_URL" || echo "000")
+            echo "Health check attempt $i: HTTP $HTTP_CODE"
+            if [ "$HTTP_CODE" = "200" ]; then
+              echo "Deployment healthy: $PUBLIC_URL responded with HTTP 200"
               exit 0
             fi
             sleep 15
           done
-          echo "Health check failed: $HEALTH_URL never returned HTTP 200"
+          echo "Health check failed: $PUBLIC_URL did not return HTTP 200"
           exit 1
-
-      - name: Deployment summary
-        if: always()
-        run: |
-          echo "Image: $FULL_IMAGE:${{ github.sha }}"
-          echo "ECR: $ECR_REGISTRY/$ECR_REPOSITORY"
-          echo "Instance: $INSTANCE_ID"
-          echo "Health URL: $HEALTH_URL"
