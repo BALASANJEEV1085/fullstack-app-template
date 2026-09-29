@@ -1,45 +1,74 @@
-name: Deploy FullStack App to EC2
+name: Deploy Fullstack App to EC2 Docker
 
 on:
+  workflow_dispatch:
   push:
     branches: [main]
-  workflow_dispatch:
 
 env:
   AWS_REGION: ap-south-1
   ECR_REGISTRY: 759204735992.dkr.ecr.ap-south-1.amazonaws.com
   ECR_REPOSITORY: fullstack-app-template
+  IMAGE_TAG: latest
   INSTANCE_ID: i-0763c275a44301232
+  PUBLIC_URL: http://3.108.70.64
 
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
+      - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Configure AWS credentials via env
-        run: |
-          echo "AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }}" >> $GITHUB_ENV
-          echo "AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }}" >> $GITHUB_ENV
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
 
-      - name: Build Docker image
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build frontend
+        working-directory: frontend
+        run: |
+          npm install --legacy-peer-deps
+          npm run build
+
+      - name: Build backend (user service)
         working-directory: backend
         run: |
-          set -x
-          docker build -t "$ECR_REGISTRY/$ECR_REPOSITORY:${{ github.sha }}" .
-          docker tag "$ECR_REGISTRY/$ECR_REPOSITORY:${{ github.sha }}" "$ECR_REGISTRY/$ECR_REPOSITORY:latest"
+          mvn clean package -DskipTests -B
 
-      - name: Push image to ECR
+      - name: Build backend (booking service)
+        working-directory: backend-booking
         run: |
-          set -x
-          aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "$ECR_REGISTRY"
-          docker push "$ECR_REGISTRY/$ECR_REPOSITORY:${{ github.sha }}"
-          docker push "$ECR_REGISTRY/$ECR_REPOSITORY:latest"
+          mvn clean package -DskipTests -B
 
-      - name: Deploy to EC2 via SSM
+      - name: Configure AWS credentials
         run: |
-          set -x
+          aws configure set aws_access_key_id "${{ secrets.AWS_ACCESS_KEY_ID }}"
+          aws configure set aws_secret_access_key "${{ secrets.AWS_SECRET_ACCESS_KEY }}"
+          aws configure set region "${{ env.AWS_REGION }}"
+
+      - name: Login to Amazon ECR
+        run: |
+          aws ecr get-login-password --region "${{ env.AWS_REGION }}" | docker login --username AWS --password-stdin "${{ env.ECR_REGISTRY }}"
+
+      - name: Build and push Docker image
+        run: |
+          FULL_IMAGE="${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}"
+          docker build -t "$FULL_IMAGE:${{ env.IMAGE_TAG }}" .
+          docker push "$FULL_IMAGE:${{ env.IMAGE_TAG }}"
+
+      - name: Deploy via SSM
+        run: |
+          FULL_IMAGE="${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}"
           cat > /tmp/ssm-params.json << 'SSMPARAMS'
           {
             "commands": [
@@ -47,31 +76,29 @@ jobs:
               "docker pull 759204735992.dkr.ecr.ap-south-1.amazonaws.com/fullstack-app-template:latest",
               "docker stop app || true",
               "docker rm app || true",
-              "docker run -d --restart always -p 80:8080 --name app -e SPRING_PROFILES_ACTIVE=docker -e SERVER_PORT=8080 759204735992.dkr.ecr.ap-south-1.amazonaws.com/fullstack-app-template:latest"
+              "docker run -d --restart always -p 80:80 --name app 759204735992.dkr.ecr.ap-south-1.amazonaws.com/fullstack-app-template:latest"
             ]
           }
           SSMPARAMS
-          COMMAND_ID=$(aws ssm send-command --instance-ids "$INSTANCE_ID" --region "$AWS_REGION" --document-name "AWS-RunShellScript" --parameters file:///tmp/ssm-params.json --query "Command.CommandId" --output text)
-          echo "SSM command id: $COMMAND_ID"
-          aws ssm wait command-executed --instance-id "$INSTANCE_ID" --command-id "$COMMAND_ID" --region "$AWS_REGION"
-          STATUS=$(aws ssm get-command-invocation --instance-id "$INSTANCE_ID" --command-id "$COMMAND_ID" --region "$AWS_REGION" --query "Status" --output text)
-          echo "Command status: $STATUS"
-          if [ "$STATUS" != "Success" ]; then
-            aws ssm get-command-invocation --instance-id "$INSTANCE_ID" --command-id "$COMMAND_ID" --region "$AWS_REGION" --query "{Stdout:StandardOutputContent,Stderr:StandardErrorContent}" --output text
-            exit 1
-          fi
+          COMMAND_ID=$(aws ssm send-command --instance-ids "${{ env.INSTANCE_ID }}" --region "${{ env.AWS_REGION }}" --document-name "AWS-RunShellScript" --parameters file:///tmp/ssm-params.json --query "Command.CommandId" --output text)
+          echo "Command ID: $COMMAND_ID"
+          sleep 30
+          aws ssm wait command-executed --instance-ids "${{ env.INSTANCE_ID }}" --command-id "$COMMAND_ID" --region "${{ env.AWS_REGION }}"
 
       - name: Health check
         run: |
-          set -x
-          for i in $(seq 1 20); do
-            CODE=$(curl -s -o /dev/null -w "%{http_code}" http://3.108.70.64 || true)
-            echo "Attempt $i: HTTP $CODE"
-            if [ "$CODE" = "200" ]; then
-              echo "Deployment healthy"
-              exit 0
+          SUCCESS=false
+          for i in $(seq 1 30); do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" "${{ env.PUBLIC_URL }}" || true)
+            if [ "$STATUS" = "200" ]; then
+              echo "App is healthy!"
+              SUCCESS=true
+              break
             fi
+            echo "Attempt $i: status $STATUS, retrying..."
             sleep 10
           done
-          echo "Health check failed"
-          exit 1
+          if [ "$SUCCESS" != "true" ]; then
+            echo "Health check failed after all retries."
+            exit 1
+          fi
