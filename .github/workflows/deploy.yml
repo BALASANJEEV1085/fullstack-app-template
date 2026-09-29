@@ -7,18 +7,17 @@ on:
 
 env:
   AWS_REGION: ap-south-1
-  ECR_REPOSITORY: fullstack-app-template
   ECR_REGISTRY: 759204735992.dkr.ecr.ap-south-1.amazonaws.com
+  ECR_REPOSITORY: fullstack-app-template
+  IMAGE_TAG: ${{ github.sha }}
   INSTANCE_ID: i-0763c275a44301232
   PUBLIC_URL: http://3.108.70.64
-  SECRETS_MANAGER_ID: deptic/fullstack-app-template/secrets
 
 jobs:
-  build-and-deploy:
+  build-and-push:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Set up Docker Buildx
@@ -28,121 +27,86 @@ jobs:
         run: |
           export AWS_ACCESS_KEY_ID="${{ secrets.AWS_ACCESS_KEY_ID }}"
           export AWS_SECRET_ACCESS_KEY="${{ secrets.AWS_SECRET_ACCESS_KEY }}"
-          echo "AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }}" >> $GITHUB_ENV
-          echo "AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }}" >> $GITHUB_ENV
-          aws sts get-caller-identity --region "$AWS_REGION"
+          echo "AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}" >> $GITHUB_ENV
+          echo "AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}" >> $GITHUB_ENV
 
-      - name: Build diagnostic - verify project structure
+      - name: Login to Amazon ECR
         run: |
-          echo "=== Repository structure check ==="
-          test -f root Dockerfile 2>/dev/null || test -f Dockerfile || (echo "Dockerfile missing at repo root" && exit 1)
-          test -f frontend/package.json || (echo "frontend/package.json missing" && exit 1)
-          test -f backend/pom.xml || (echo "backend/pom.xml missing" && exit 1)
-          test -f backend-booking/pom.xml || (echo "backend-booking/pom.xml missing" && exit 1)
-          test -f database/01-init-schemas.sql || (echo "database/01-init-schemas.sql missing" && exit 1)
-          echo "=== All required build inputs present ==="
+          aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "$ECR_REGISTRY"
 
       - name: Build unified production image
         run: |
           FULL_IMAGE="$ECR_REGISTRY/$ECR_REPOSITORY"
-          echo "Building image: $FULL_IMAGE"
-          docker build \
-            --build-arg VITE_API_BASE_URL="" \
-            -t "$FULL_IMAGE:latest" \
-            -t "$FULL_IMAGE:${GITHUB_SHA::8}" \
-            -f Dockerfile .
+          docker buildx build \
+            --file Dockerfile \
+            --tag "$FULL_IMAGE:$IMAGE_TAG" \
+            --tag "$FULL_IMAGE:latest" \
+            --load \
+            .
 
-      - name: Build diagnostics - inspect built image
+      - name: Push image to Amazon ECR
         run: |
           FULL_IMAGE="$ECR_REGISTRY/$ECR_REPOSITORY"
-          docker image inspect "$FULL_IMAGE:${GITHUB_SHA::8}" --format 'Image built: {{.Id}} size={{.Size}}'
-          echo "=== Exposed ports ==="
-          docker image inspect "$FULL_IMAGE:${GITHUB_SHA::8}" --format '{{json .Config.ExposedPorts}}'
-          echo "=== Healthcheck ==="
-          docker image inspect "$FULL_IMAGE:${GITHUB_SHA::8}" --format '{{json .Config.Healthcheck}}'
-
-      - name: Push image to ECR
-        run: |
-          FULL_IMAGE="$ECR_REGISTRY/$ECR_REPOSITORY"
-          AWS_ACCESS_KEY_ID="${{ secrets.AWS_ACCESS_KEY_ID }}" \
-          AWS_SECRET_ACCESS_KEY="${{ secrets.AWS_SECRET_ACCESS_KEY }}" \
-          aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "$ECR_REGISTRY"
+          docker push "$FULL_IMAGE:$IMAGE_TAG"
           docker push "$FULL_IMAGE:latest"
-          docker push "$FULL_IMAGE:${GITHUB_SHA::8}"
 
-      - name: Deploy to EC2 via SSM (pull, stop old, run new on port 80)
+  deploy:
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    steps:
+      - name: Configure AWS credentials (static)
         run: |
-          FULL_IMAGE="$ECR_REGISTRY/$ECR_REPOSITORY"
-          IMAGE_URI="$FULL_IMAGE:${GITHUB_SHA::8}"
-          REGION="$AWS_REGION"
-          INSTANCE_ID="$INSTANCE_ID"
+          export AWS_ACCESS_KEY_ID="${{ secrets.AWS_ACCESS_KEY_ID }}"
+          export AWS_SECRET_ACCESS_KEY="${{ secrets.AWS_SECRET_ACCESS_KEY }}"
+          echo "AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}" >> $GITHUB_ENV
+          echo "AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}" >> $GITHUB_ENV
 
+      - name: Deploy container on EC2 via SSM
+        run: |
+          export AWS_DEFAULT_REGION="$AWS_REGION"
+          IMAGE_URI="$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
           cat > /tmp/ssm-params.json << 'SSMPARAMS'
           {
             "commands": [
-              "set -e",
-              "aws ecr get-login-password --region $REGION | docker login --username AWS --password-stdin $ECR_REGISTRY",
-              "docker pull $IMAGE_URI",
+              "aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${ECR_REGISTRY}",
+              "docker pull ${IMAGE_URI}",
               "docker stop app || true",
               "docker rm app || true",
-              "SECRET_JSON=$(aws secretsmanager get-secret-value --secret-id $SECRETS_MANAGER_ID --region $REGION --query SecretString --output text)",
-              "DB_NAME=$(echo \"$SECRET_JSON\" | python3 -c 'import sys,json; print(json.load(sys.stdin).get(\"DB_NAME\",\"fullstack_db\"))')",
-              "DB_USERNAME=$(echo \"$SECRET_JSON\" | python3 -c 'import sys,json; print(json.load(sys.stdin).get(\"DB_USERNAME\",\"postgres\"))')",
-              "DB_PASSWORD=$(echo \"$SECRET_JSON\" | python3 -c 'import sys,json; print(json.load(sys.stdin).get(\"DB_PASSWORD\",\"postgres\"))')",
-              "docker run -d --restart always --name app -p 80:80 \\",
-              "  -e SERVER_PORT=8080 -e BOOKING_SERVER_PORT=8081 \\",
-              "  -e DB_HOST=host.docker.internal -e DB_PORT=5432 \\",
-              "  -e DB_NAME=\"$DB_NAME\" -e DB_USERNAME=\"$DB_USERNAME\" -e DB_PASSWORD=\"$DB_PASSWORD\" \\",
-              "  --add-host=host.docker.internal:host-gateway \\",
-              "  $IMAGE_URI",
-              "sleep 15",
-              "docker ps --filter name=app --format '{{.Status}}'"
+              "docker run -d --restart always -p 80:80 --name app ${IMAGE_URI}"
             ]
           }
           SSMPARAMS
-
           COMMAND_ID=$(aws ssm send-command \
             --instance-ids "$INSTANCE_ID" \
-            --region "$REGION" \
+            --region "$AWS_REGION" \
             --document-name "AWS-RunShellScript" \
-            --comment "Deploy fullstack-app-template ${GITHUB_SHA::8}" \
             --parameters file:///tmp/ssm-params.json \
             --query "Command.CommandId" --output text)
-
-          echo "SSM Command ID: $COMMAND_ID"
-          aws ssm wait command-executed --instance-id "$INSTANCE_ID" --command-id "$COMMAND_ID" --region "$REGION"
-          aws ssm get-command-invocation \
-            --instance-id "$INSTANCE_ID" \
-            --command-id "$COMMAND_ID" \
-            --region "$REGION" \
-            --query "{Status:Status,Output:Output,Error:StandardErrorContent}" \
-            --output text > /tmp/ssm-result.txt
-          cat /tmp/ssm-result.txt
-          STATUS=$(aws ssm get-command-invocation --instance-id "$INSTANCE_ID" --command-id "$COMMAND_ID" --region "$REGION" --query "Status" --output text)
+          aws ssm wait command-executed --instance-id "$INSTANCE_ID" --command-id "$COMMAND_ID" --region "$AWS_REGION"
+          STATUS=$(aws ssm get-command-invocation --instance-id "$INSTANCE_ID" --command-id "$COMMAND_ID" --region "$AWS_REGION" --query "Status" --output text)
+          echo "SSM command status: $STATUS"
           if [ "$STATUS" != "Success" ]; then
-            echo "Deployment command failed with status: $STATUS"
+            aws ssm get-command-invocation --instance-id "$INSTANCE_ID" --command-id "$COMMAND_ID" --region "$AWS_REGION" --query "StandardErrorContent" --output text
             exit 1
           fi
 
-      - name: Health check - must return HTTP 200
+  verify:
+    runs-on: ubuntu-latest
+    needs: deploy
+    steps:
+      - name: Wait for application startup
+        run: sleep 60
+
+      - name: Health check (must return HTTP 200)
         run: |
-          echo "Verifying $PUBLIC_URL ..."
-          for i in $(seq 1 12); do
-            HTTP_CODE=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$PUBLIC_URL" || echo "000")
-            echo "Attempt $i: HTTP $HTTP_CODE"
-            if [ "$HTTP_CODE" = "200" ]; then
-              echo "Health check passed: $PUBLIC_URL returned HTTP 200"
+          for i in $(seq 1 15); do
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "$PUBLIC_URL/" || echo "000")
+            echo "Attempt $i — HTTP status: $CODE"
+            if [ "$CODE" = "200" ]; then
+              echo "Deployment verified: $PUBLIC_URL is healthy."
               exit 0
             fi
-            sleep 15
+            sleep 20
           done
-          echo "Health check FAILED: $PUBLIC_URL did not return HTTP 200"
+          echo "Health check failed after all attempts."
           exit 1
-
-      - name: Deployment summary
-        if: always()
-        run: |
-          echo "=== Deployment Summary ==="
-          echo "Image: $ECR_REGISTRY/$ECR_REPOSITORY:${GITHUB_SHA::8}"
-          echo "Target: EC2 Docker ($INSTANCE_ID)"
-          echo "URL: $PUBLIC_URL"
